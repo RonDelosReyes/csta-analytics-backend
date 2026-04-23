@@ -69,10 +69,15 @@ def calculate_student_metrics(user_id: int, current_score_perc: float):
 async def analyze_attempt(attempt_id: int):
     """
     Endpoint to run predictive analytics on a specific quiz attempt.
+    Also updates the long-term performance insights (Strengths/Weaknesses).
     """
     try:
-        # 1. Fetch the specific attempt data
-        res = supabase.table("tbl_assessment_attempt").select("*").eq("attempt_id", attempt_id).single().execute()
+        # 1. Fetch the specific attempt data joined with category info
+        res = supabase.table("tbl_assessment_attempt") \
+            .select("*, tbl_assessment(category_no)") \
+            .eq("attempt_id", attempt_id) \
+            .single().execute()
+            
         if not res.data:
             raise HTTPException(status_code=404, detail="Attempt record not found")
         
@@ -80,55 +85,69 @@ async def analyze_attempt(attempt_id: int):
         user_id = attempt_data['user_no']
         raw_score = attempt_data['raw_score']
         total_q = attempt_data['total_questions']
+        cat_id = attempt_data['tbl_assessment']['category_no']
         current_perc = (raw_score / total_q) * 100
 
-        # 2. Perform Feature Engineering (Extract Student Patterns)
+        # 2. Perform Feature Engineering
         metrics = calculate_student_metrics(user_id, current_perc)
-        
         avg = metrics["avg_score"]
         trend = metrics["trend"]
-        consistency = metrics["consistency"]
 
-        # 3. Real Predictive Logic (Weighted Heuristic Model)
-        # This formula predicts the 'Mastery Level' by weighing current performance, 
-        # long-term memory (average), and learning momentum (trend).
-        
-        # Weights: 50% Current, 30% Long-term, 20% Momentum
+        # 3. Mastery Prediction Formula
         predictive_score = (current_perc * 0.5) + (avg * 0.3) + (trend * 0.2)
 
-        # Classification based on predictive score and trend behavior
+        # 4. Strength/Weakness Logic
+        is_strength = predictive_score >= 80
+        is_weakness = predictive_score < 60
+        
+        # Classification for individual attempt record
         if predictive_score >= 90:
             level = "Mastery (Exceeding Expectations)"
         elif predictive_score >= 75:
-            if trend < -15: # Score is high but dropping fast
-                level = "Proficient (Warning: Declining Trend)"
-            else:
-                level = "Proficient (Stable Learning)"
+            level = "Proficient (Stable Learning)" if trend >= -15 else "Proficient (Warning: Declining)"
         elif predictive_score >= 60:
-            if trend > 5: # Score is lower but showing active improvement
-                level = "Emerging (Positive Momentum)"
-            else:
-                level = "Developing (Needs Consistency)"
+            level = "Emerging (Positive Momentum)" if trend > 5 else "Developing (Needs Consistency)"
         else:
-            level = "Requires Intervention (Struggling)"
+            level = "Requires Intervention"
 
-        # 4. Update Supabase with the analytics result
-        update_res = supabase.table("tbl_assessment_attempt") \
+        # 5. Fetch First-Time Baseline for Improvement calculation
+        baseline_res = supabase.table("tbl_student_analytics") \
+            .select("first_score, total_questions") \
+            .eq("user_no", user_id) \
+            .eq("cat_id", cat_id) \
+            .maybe_single().execute()
+            
+        first_perc = 0
+        if baseline_res.data:
+            first_perc = (baseline_res.data['first_score'] / baseline_res.data['total_questions']) * 100
+
+        # 6. Upsert into tbl_performance_insight (The Student Report Data)
+        supabase.table("tbl_performance_insight").upsert({
+            "user_no": user_id,
+            "cat_id": cat_id,
+            "first_score_perc": float(first_perc),
+            "current_avg_perc": float(avg),
+            "improvement_perc": float(predictive_score - first_perc),
+            "mastery_score": float(predictive_score),
+            "mastery_level": level.split(" (")[0], # Clean name like 'Proficient'
+            "is_strength": is_strength,
+            "is_weakness": is_weakness,
+            "last_updated": "now()"
+        }).execute()
+
+        # 7. Update original attempt record with the analytics result
+        supabase.table("tbl_assessment_attempt") \
             .update({"processed_level": level}) \
             .eq("attempt_id", attempt_id).execute()
 
         return {
             "status": "success",
-            "attempt_id": attempt_id,
-            "metrics": {
-                "current_score": f"{current_perc:.1f}%",
-                "historical_avg": f"{avg:.1f}%",
-                "improvement_trend": f"{trend:+.1f}%"
-            },
-            "predicted_level": level
+            "predicted_level": level,
+            "mastery_score": f"{predictive_score:.1f}%"
         }
 
     except Exception as e:
+        print(f"Server Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/")
