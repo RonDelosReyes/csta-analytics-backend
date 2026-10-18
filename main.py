@@ -30,31 +30,28 @@ def calculate_student_metrics(user_id: int, current_score_perc: float):
             .select("raw_score, total_questions, created_at") \
             .eq("user_no", user_id) \
             .order("created_at", desc=True) \
-            .limit(6).execute() # We take 6 to compare current with up to 5 historical ones
+            .limit(6).execute() 
         
         history = response.data
         
         # If this is their first attempt ever (excluding the one we just saved)
-        if len(history) <= 1:
+        if not history or len(history) <= 1:
             return {
-                "avg_score": current_score_perc,
+                "avg_score": float(current_score_perc),
                 "trend": 0.0,
-                "consistency": 1.0 # Perfect consistency on first try
+                "consistency": 1.0 
             }
 
-        # Extract historical scores (excluding the very first one in the list which is the current one)
+        # Extract historical scores
         historical_scores = [
             (h['raw_score'] / h['total_questions']) * 100 
             for h in history[1:]
         ]
         
-        avg_score = np.mean(historical_scores)
-        # Trend: Difference between current and previous attempt
-        prev_score = historical_scores[0]
-        trend = current_score_perc - prev_score
-        
-        # Consistency: Standard deviation (Low is better/more consistent)
-        consistency = np.std(historical_scores) if len(historical_scores) > 1 else 0.0
+        avg_score = float(np.mean(historical_scores))
+        prev_score = float(historical_scores[0])
+        trend = float(current_score_perc - prev_score)
+        consistency = float(np.std(historical_scores)) if len(historical_scores) > 1 else 0.0
 
         return {
             "avg_score": avg_score,
@@ -63,44 +60,65 @@ def calculate_student_metrics(user_id: int, current_score_perc: float):
         }
     except Exception as e:
         print(f"Metrics Error: {e}")
-        return {"avg_score": current_score_perc, "trend": 0.0, "consistency": 0.0}
+        return {"avg_score": float(current_score_perc), "trend": 0.0, "consistency": 0.0}
 
 @app.post("/analyze/{attempt_id}")
 async def analyze_attempt(attempt_id: int):
     """
     Endpoint to run predictive analytics on a specific quiz attempt.
-    Also updates the long-term performance insights (Strengths/Weaknesses).
     """
     try:
-        # 1. Fetch the specific attempt data joined with category info
+        if supabase is None:
+            raise HTTPException(status_code=500, detail="Supabase client not initialized")
+
+        # 1. Fetch the specific attempt data
         res = supabase.table("tbl_assessment_attempt") \
             .select("*, tbl_assessment(category_no)") \
             .eq("attempt_id", attempt_id) \
-            .single().execute()
+            .execute()
             
-        if not res.data:
+        if not res or not res.data:
             raise HTTPException(status_code=404, detail="Attempt record not found")
         
-        attempt_data = res.data
+        attempt_data = res.data[0]
         user_id = attempt_data['user_no']
         raw_score = attempt_data['raw_score']
         total_q = attempt_data['total_questions']
-        cat_id = attempt_data['tbl_assessment']['category_no']
-        current_perc = (raw_score / total_q) * 100
+        
+        category_data = attempt_data.get('tbl_assessment')
+        if not category_data:
+            raise HTTPException(status_code=404, detail="Linked assessment not found")
+            
+        cat_id = category_data['category_no']
+        
+        # Calculate current percentage and CAP it at 100%
+        current_perc = float((raw_score / total_q) * 100) if total_q > 0 else 0.0
+        if current_perc > 100:
+            current_perc = 100.0
 
         # 2. Perform Feature Engineering
         metrics = calculate_student_metrics(user_id, current_perc)
-        avg = metrics["avg_score"]
-        trend = metrics["trend"]
+        avg = float(metrics["avg_score"])
+        # Ensure avg doesn't exceed 100
+        if avg > 100: avg = 100.0
+        
+        trend = float(metrics["trend"])
 
         # 3. Mastery Prediction Formula
-        predictive_score = (current_perc * 0.5) + (avg * 0.3) + (trend * 0.2)
+        # We weight Current and Average to 100%, and use trend as a modifier
+        predictive_score = float((current_perc * 0.7) + (avg * 0.3))
+        
+        # Cap final mastery score at 100%
+        if predictive_score > 100:
+            predictive_score = 100.0
+        if predictive_score < 0:
+            predictive_score = 0.0
 
         # 4. Strength/Weakness Logic
-        is_strength = predictive_score >= 80
-        is_weakness = predictive_score < 60
+        is_strength = bool(predictive_score >= 80)
+        is_weakness = bool(predictive_score < 60)
         
-        # Classification for individual attempt record
+        # Classification
         if predictive_score >= 90:
             level = "Mastery (Exceeding Expectations)"
         elif predictive_score >= 75:
@@ -110,32 +128,34 @@ async def analyze_attempt(attempt_id: int):
         else:
             level = "Requires Intervention"
 
-        # 5. Fetch First-Time Baseline for Improvement calculation
+        # 5. Fetch First-Time Baseline
         baseline_res = supabase.table("tbl_student_analytics") \
             .select("first_score, total_questions") \
             .eq("user_no", user_id) \
             .eq("cat_id", cat_id) \
-            .maybe_single().execute()
+            .execute()
             
-        first_perc = 0
-        if baseline_res.data:
-            first_perc = (baseline_res.data['first_score'] / baseline_res.data['total_questions']) * 100
+        first_perc = 0.0
+        if baseline_res and baseline_res.data:
+            b_data = baseline_res.data[0]
+            if b_data['total_questions'] > 0:
+                first_perc = float((b_data['first_score'] / b_data['total_questions']) * 100)
 
-        # 6. Upsert into tbl_performance_insight (The Student Report Data)
+        # 6. Upsert into tbl_performance_insight
         supabase.table("tbl_performance_insight").upsert({
-            "user_no": user_id,
-            "cat_id": cat_id,
+            "user_no": int(user_id),
+            "cat_id": int(cat_id),
             "first_score_perc": float(first_perc),
             "current_avg_perc": float(avg),
             "improvement_perc": float(predictive_score - first_perc),
             "mastery_score": float(predictive_score),
-            "mastery_level": level.split(" (")[0], # Clean name like 'Proficient'
+            "mastery_level": level.split(" (")[0],
             "is_strength": is_strength,
             "is_weakness": is_weakness,
             "last_updated": "now()"
         }).execute()
 
-        # 7. Update original attempt record with the analytics result
+        # 7. Update original attempt record
         supabase.table("tbl_assessment_attempt") \
             .update({"processed_level": level}) \
             .eq("attempt_id", attempt_id).execute()
