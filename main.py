@@ -170,6 +170,58 @@ async def analyze_attempt(attempt_id: int):
         print(f"Server Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/analyze/self_assessment/{user_id}")
+async def analyze_self_assessment(user_id: int):
+    """
+    Processes a beginner student's self-assessment responses from tbl_student_analytics
+    and calculates initial baseline priors in tbl_performance_insight across all course categories.
+    """
+    try:
+        if supabase is None:
+            raise HTTPException(status_code=500, detail="Supabase client not initialized")
+
+        # Fetch beginner's initial category scores from tbl_student_analytics
+        res = supabase.table("tbl_student_analytics") \
+            .select("*") \
+            .eq("user_no", user_id) \
+            .execute()
+
+        if not res or not res.data:
+            return {"status": "warning", "message": "No baseline analytics found for user"}
+
+        processed_count = 0
+        for entry in res.data:
+            cat_id = entry['cat_id']
+            first_score = float(entry['first_score'])
+            total_q = float(entry['total_questions'])
+            first_perc = (first_score / total_q) * 100.0 if total_q > 0 else 50.0
+
+            is_strength = bool(first_perc >= 80)
+            is_weakness = bool(first_perc < 60)
+            level = "Emerging" if first_perc >= 70 else "Developing"
+
+            supabase.table("tbl_performance_insight").upsert({
+                "user_no": int(user_id),
+                "cat_id": int(cat_id),
+                "first_score_perc": float(first_perc),
+                "current_avg_perc": float(first_perc),
+                "improvement_perc": 0.0,
+                "mastery_score": float(first_perc),
+                "mastery_level": level,
+                "is_strength": is_strength,
+                "is_weakness": is_weakness,
+                "last_updated": "now()"
+            }).execute()
+            processed_count += 1
+
+        return {
+            "status": "success",
+            "message": f"Processed {processed_count} category baselines for beginner user {user_id}"
+        }
+    except Exception as e:
+        print(f"Self-Assessment Processing Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/")
 def health_check():
     return {"status": "online", "message": "CSTA Analytics API is running"}
