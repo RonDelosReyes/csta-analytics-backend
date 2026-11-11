@@ -180,7 +180,6 @@ async def analyze_self_assessment(user_id: int):
         if supabase is None:
             raise HTTPException(status_code=500, detail="Supabase client not initialized")
 
-        # Fetch beginner's initial category scores from tbl_student_analytics
         res = supabase.table("tbl_student_analytics") \
             .select("*") \
             .eq("user_no", user_id) \
